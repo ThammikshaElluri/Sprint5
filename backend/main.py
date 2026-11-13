@@ -1,6 +1,6 @@
 from fastapi.middleware.cors import CORSMiddleware
 
-from fastapi import FastAPI, HTTPException, Header, Body
+from fastapi import FastAPI, HTTPException, Header, Body,Depends
 from pydantic import BaseModel, Field
 import functions
 import jwt
@@ -12,9 +12,28 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
+
 )
 
+def get_current_user(token=Header(None)):
+    payload = functions.verify_token(token, "access")
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token")
+    return payload
+
+def require_roles(*allowed_roles):
+    def check_role(current_user=Depends(get_current_user)):
+        if current_user.get("role") not in allowed_roles:
+            raise HTTPException(status_code=403, detail="You do not have permission")
+        return current_user
+    return check_role
+
 # Pydantic
+class UserRegistration(BaseModel):
+    user_name: str
+    password: str
+    role: str
+    
 class packagedetails(BaseModel):
     package_name: str
     destination: str
@@ -44,36 +63,42 @@ def login(username = Body(), password = Body()):
     return token
 
 @app.post("/refresh")
-def refresh(refresh_token = Header(None)):
-    username = functions.verify_token(token=refresh_token, token_type = "refresh")
-    if not username:
-        raise HTTPException(status_code = 401, detail = "Invalid or refresh token")
-    access_token = functions.create_token(username=username, token_type = "access")
+def refresh(refresh_token=Header(None)):
+    payload = functions.verify_token(token=refresh_token,token_type="refresh",)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+    access_token = functions.create_token(username=payload["username"],role=payload["role"],token_type="access",)
     return {"access_token": access_token}
 
 @app.post("/register_user")
-def register_user(user_name = Body(), password = Body()):
-    if functions.register_user(user_name=user_name, password=password):
-        return{"message": "user registerd sucessfully"}
-    raise HTTPException(status_code=400, detail="user already exists")
+def register_user(user: UserRegistration):
+    allowed_roles = {"admin", "warehouse_staff", "dispatcher"}
+
+    if user.role not in allowed_roles:
+        raise HTTPException(status_code=422, detail="Invalid role")
+
+    if functions.register_user(user_name=user.user_name,password=user.password,role=user.role,
+    ):
+        return {"message": "User registered successfully"}
+
+    raise HTTPException(status_code=400, detail="User already exists")
 
 # E1 
 @app.post("/packages")
-def register_package(package: packagedetails, token=Header(None)):
-    username = functions.verify_token(token=token, token_type="access")
-    if not username:
-        raise HTTPException(status_code=401, detail="Invalid or expiry token")
-    return functions.add_package( package.package_name,
+def register_package(package: packagedetails,current_user=Depends(require_roles("admin", "warehouse_staff")),
+):
+    return functions.add_package(
+        package.package_name,
         package.destination,
         package.weight,
-        package.arrival_date)
+        package.arrival_date,
+    )
 
 # E2 
 @app.get("/packages/{package_id}")
-def get_package(package_id: int, token = Header(None)):
-    username = functions.verify_token(token=token, token_type="access")
-    if not username:
-        raise HTTPException(status_code = 401, detail = "Invalid or expiry token")
+def get_package(package_id: int,current_user=Depends(get_current_user),
+):
     response = functions.get_package(package_id)
     if response is None:
         raise HTTPException(status_code=404, detail="Package not found")
@@ -81,12 +106,8 @@ def get_package(package_id: int, token = Header(None)):
 
 # E3 
 @app.patch("/packages/{package_id}")
-def update_package(package: packageupdate, package_id: int, token = Header(None)):
-    username = functions.verify_token(token=token, token_type = "access")
-    if not username:
-        raise HTTPException(status_code = 401, detail = "Invalid or expiry token")
-    if package.weight is not None and package.weight <= 0:
-        raise HTTPException(status_code=422, detail="Incorrect weight")
+def update_package( package: packageupdate,package_id: int,current_user=Depends(require_roles("admin", "warehouse_staff")),
+):
     data = {}
     if package.package_name is not None:
         data["package_name"] = package.package_name
@@ -96,8 +117,10 @@ def update_package(package: packageupdate, package_id: int, token = Header(None)
         data["weight"] = package.weight
     if package.arrival_date is not None:
         data["arrival_date"] = package.arrival_date
-    if len(data) == 0:
+
+    if not data:
         raise HTTPException(status_code=400, detail="No update details provided")
+
     response = functions.update_package(package_id, data)
     if response == "not_found":
         raise HTTPException(status_code=404, detail="Package not found")
@@ -109,15 +132,18 @@ def update_package(package: packageupdate, package_id: int, token = Header(None)
 
 # E4 
 @app.delete("/packages/{package_id}")
-def delete_package(package_id: int, token = Header(None)):
-    username = functions.verify_token(token=token, token_type = "access")
-    if not username:
-        raise HTTPException(status_code = 401, detail = "Invalid or expiry token")
+def delete_package(
+    package_id: int,
+    current_user=Depends(require_roles("admin", "warehouse_staff")),
+):
     response = functions.delete_package(package_id)
     if response == "not_found":
         raise HTTPException(status_code=404, detail="Package not found")
     if response == "already_dispatched":
-        raise HTTPException(status_code=400, detail="Dispatched package cannot be deleted")
+        raise HTTPException(
+            status_code=400,
+            detail="Dispatched package cannot be deleted",
+        )
     return {"message": "Package deleted successfully"}
 
 # E5 
@@ -151,22 +177,21 @@ def warehouse_statistics(token = Header(None)):
 # E8
 @app.post("/dispatch-batches")
 def create_dispatch_batch(package: DispatchBatchDetails, token=Header(None)):
-    username = functions.verify_token(token=token, token_type="access")
-    if not username:
+    if not functions.verify_token(token=token, token_type="access"):
         raise HTTPException(status_code=401, detail="Invalid or expiry token")
-    
-    response = functions.create_dispatch_batch( package.destination,
-        package.vehicle,
-        package.package_ids,
-        package.dispatch_status)
-    if response == "package_not_found":
-        raise HTTPException(status_code=404, detail="Package not found")
-    if response == "already_dispatched":
-        raise HTTPException(status_code=400, detail="Package already dispatched")
-    if response == "already_assigned":
-        raise HTTPException(status_code=400, detail="Package already assigned")
-    if response == "destination_mismatch":
-        raise HTTPException(status_code=400, detail="Destination does not match")
-    if response == "no_packages":
-        raise HTTPException(status_code=400, detail="No packages provided")
+
+    response = functions.create_dispatch_batch(
+        package.destination, package.vehicle, package.package_ids,
+        package.dispatch_status
+    )
+    errors = {
+        "package_not_found": (404, "Package not found"),
+        "already_dispatched": (400, "Package already dispatched"),
+        "already_assigned": (400, "Package already assigned"),
+        "destination_mismatch": (400, "Destination does not match"),
+        "no_packages": (400, "No packages provided"),
+    }
+    if response in errors:
+        status, detail = errors[response]
+        raise HTTPException(status_code=status, detail=detail)
     return response

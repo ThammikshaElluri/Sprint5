@@ -57,59 +57,62 @@ def package_details(package):
         "dispatch_batch_id": package.dispatch_batch_id
     }
 
+def create_token(username, role, token_type):
+    token_minutes = ACCESS_TOKEN_EXPIRY
+    if token_type == "refresh":
+        token_minutes = REFRESH_TOKEN_EXPIRY
+
+    payload = {
+        "username": username,
+        "role": role,
+        "token_type": token_type,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=token_minutes),
+    }
+    return jwt.encode(payload=payload, key=SECRET_KEY, algorithm=ALGORITHM)
+
+
+def verify_token(token, token_type):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.PyJWTError:
+        return None
+
+    if payload.get("token_type") != token_type:
+        return None
+
+    return payload
+
 def verify_login(username, password):
     session = Session(engine)
     user = session.query(User).filter_by(user_name=username).first()
+
     if user is None:
         session.close()
-        return False 
+        return False
+
     try:
         ph.verify(user.password, password)
     except VerifyMismatchError:
         session.close()
         return False
+    role=user.role
+    access_token = create_token(username=user.user_name,role=user.role,token_type="access",)
+    refresh_token = create_token(username=user.user_name,role=user.role,token_type="refresh",)
     
     session.close()
-    access_token = create_token(username=username, token_type = "access")
-    refresh_token = create_token(username=username, token_type = "refresh")
-    return{"access_token": access_token, "refresh_token": refresh_token}
-
-
-    # if username == USERNAME and password == PASSWORD:
-    #     access_token = create_token(username=username, token_type ="access")
-    #     refresh_token = create_token(username=username, token_type ="refresh")
-    #     return {"access_token": access_token, "refresh_token": refresh_token}
-    # return None
-
-def create_token(username, token_type):
-    time = ACCESS_TOKEN_EXPIRY
-    if token_type == "refresh":
-      time = REFRESH_TOKEN_EXPIRY
-    payload = {
-        "username": username,
-        "token_type": token_type,
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=time),
-        }
-    token = jwt.encode(payload=payload, key=SECRET_KEY, algorithm=ALGORITHM)
-    return token 
-
-def verify_token(token, token_type):
-    try:
-     payload = jwt.decode(jwt=token, key=SECRET_KEY, algorithms=[ALGORITHM])
-    except:
-        return False
-    if payload["token_type"] == token_type:
-        return payload["username"]
-    return False
+    return {"access_token": access_token,"refresh_token": refresh_token, }
 
 # ---users---
-def register_user(user_name:str, password:str):
+def register_user(user_name: str, password: str, role: str):
     session = Session(engine)
     user_exists = session.query(User).filter_by(user_name=user_name).first()
+
     if user_exists is not None:
         session.close()
         return False
-    session.add(User(user_name=user_name, password=ph.hash(password)))
+
+    session.add(User(user_name=user_name,password=ph.hash(password),role=role,
+    ))
     session.commit()
     session.close()
     return True
@@ -249,45 +252,19 @@ def get_warehouse_statistics():
 # E8
 def create_dispatch_batch(destination, vehicle, package_ids, dispatch_status):
     session = Session(engine)
-    if len(package_ids) == 0:
+    if not package_ids:
         session.close()
         return "no_packages"
+
     packages = []
     for package_id in package_ids:
         package = session.get(Packages, package_id)
-        if package is None:
+        if package is None or package.status == "dispatched" or package.dispatch_batch_id is not None or package.destination != destination:
             session.close()
-            return "package_not_found"
-        if package.status == "dispatched":
-            session.close()
-            return "already_dispatched"
-        if package.dispatch_batch_id is not None:
-            session.close()
-            return "already_assigned"
-        if package.destination != destination:
-            session.close()
-            return "destination_mismatch"
+            return ("package_not_found" if package is None else
+                    "already_dispatched" if package.status == "dispatched" else
+                    "already_assigned" if package.dispatch_batch_id is not None else
+                    "destination_mismatch")
         packages.append(package)
-    batch = DispatchBatches(
-        destination=destination,
-        vehicle=vehicle,
-        dispatch_status=dispatch_status)
-    if dispatch_status == "dispatched":
-        batch.dispatch_date = date.today()
-    session.add(batch)
-    session.commit()
-    session.refresh(batch)
-    for package in packages:
-        package.dispatch_batch_id = batch.id
-        package.status = "dispatched" if dispatch_status == "dispatched" else "assigned"
-    session.commit()
-    response = {
-        "id": batch.id,
-        "destination": batch.destination,
-        "vehicle": batch.vehicle,
-        "dispatch_status": batch.dispatch_status,
-        "dispatch_date": str(batch.dispatch_date) if batch.dispatch_date else None,
-        "package_ids": package_ids
-    }
-    session.close()
-    return response
+
+    batch = DispatchBatches(destination=destination)

@@ -103,18 +103,22 @@ def verify_login(username, password):
     return {"access_token": access_token,"refresh_token": refresh_token, }
 
 # ---users---
-def register_user(user_name: str, password: str, role: str):
+def register_user(user_name, password, role):
     session = Session(engine)
-    user_exists = session.query(User).filter_by(user_name=user_name).first()
 
+    user_exists = session.query(User).filter_by(user_name=user_name).first()
     if user_exists is not None:
         session.close()
         return False
 
-    session.add(User(user_name=user_name,password=ph.hash(password),role=role,
-    ))
+    hashed_password = ph.hash(password)
+
+    session.add(User(
+        user_name=user_name,password=hashed_password, role=role))
+
     session.commit()
     session.close()
+
     return True
 
 # E1
